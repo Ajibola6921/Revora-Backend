@@ -6,7 +6,7 @@ import { AMLAlert, AMLSeverity } from './types';
 
 export interface RiskScoreWeights {
   kycTierWeights: Record<KycRiskTier, number>;
-  amlSeverityWeights: Record<AM\LSeverity, number>;
+  amlSeverityWeights: Record<AMLSeverity, number>;
   baseScore: number;
 }
 
