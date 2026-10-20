@@ -1,0 +1,27 @@
+{
+  "default_branch": "master",
+  "branches": [
+    "feat/autoscale-db-pool-signal",
+    "master",
+    "origin",
+    "security/issue-1266-security-password-reset-rate-limiter-throws",
+    "security/issue-1290-security-sanctions-investment-screening-uses",
+    "security/issue-1295-security-offerings-offerings-validation-matrix"
+  ],
+  "parent": {
+    "feat/autoscale-db-pool-signal": "master",
+    "master": null,
+    "origin": "master",
+    "security/issue-1266-security-password-reset-rate-limiter-throws": "master",
+    "security/issue-1290-security-sanctions-investment-screening-uses": "master",
+    "security/issue-1295-security-offerings-offerings-validation-matrix": "master"
+  },
+  "order": [
+    "master",
+    "feat/autoscale-db-pool-signal",
+    "origin",
+    "security/issue-1266-security-password-reset-rate-limiter-throws",
+    "security/issue-1290-security-sanctions-investment-screening-uses",
+    "security/issue-1295-security-offerings-offerings-validation-matrix"
+  ]
+}
