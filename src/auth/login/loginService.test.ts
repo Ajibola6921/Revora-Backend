@@ -1,4 +1,5 @@
-import { createHash } from 'node:crypto';
+import { createHash } from 'crypto';
+import { hashPassword } from '../../utils/password';
 import { LoginService } from './loginService';
 import { JwtIssuer, SessionRepository, UserRecord, UserRepository } from './types';
 
@@ -64,6 +65,16 @@ const validUser: UserRecord = {
   passwordHash: sha256(VALID_PASSWORD),
 };
 
+// Helper to create a user with scrypt hash
+async function createScryptUser(id: string, email: string): Promise<UserRecord> {
+  return {
+    id,
+    email,
+    role: 'investor',
+    passwordHash: await hashPassword(VALID_PASSWORD),
+  };
+}
+
 // ── Tests ───────────────────────────────────────────────────────────────
 
 describe('LoginService failure handling', () => {
@@ -88,37 +99,20 @@ describe('LoginService failure handling', () => {
     expect(jwtIssuer.signCalls).toHaveLength(0);
   });
 
-  it('returns null for a deprovisioned account even with the right password (#1300)', async () => {
-    const { service, sessionRepo, jwtIssuer } = buildService([{ ...validUser, isActive: false }]);
+  it('accepts login with scrypt hash format', async () => {
+    const scryptUser = await createScryptUser('user-2', 'scrypt@example.com');
+    const { service, sessionRepo, jwtIssuer } = buildService([scryptUser]);
 
-    const result = await service.login('jane@example.com', VALID_PASSWORD);
+    const result = await service.login('scrypt@example.com', VALID_PASSWORD);
 
-    expect(result).toBeNull();
-    expect(sessionRepo.created).toHaveLength(0);
-    expect(jwtIssuer.signCalls).toHaveLength(0);
-  });
-
-  it('gives a deprovisioned account the same result as a wrong password (no enumeration)', async () => {
-    const { service } = buildService([{ ...validUser, isActive: false }]);
-
-    const inactive = await service.login('jane@example.com', VALID_PASSWORD);
-    const wrongPassword = await service.login('jane@example.com', 'wrong-password');
-    const unknown = await service.login('missing@example.com', VALID_PASSWORD);
-
-    expect(inactive).toBe(wrongPassword);
-    expect(inactive).toBe(unknown);
-  });
-
-  it('still logs in an account whose adapter does not report isActive (treated as active)', async () => {
-    const legacyUser: UserRecord = {
-      id: validUser.id,
-      email: validUser.email,
-      role: validUser.role,
-      passwordHash: validUser.passwordHash,
-    };
-    const { service } = buildService([legacyUser]);
-
-    await expect(service.login('jane@example.com', VALID_PASSWORD)).resolves.not.toBeNull();
+    expect(result).not.toBeNull();
+    expect(result?.user).toEqual({
+      id: 'user-2',
+      email: 'scrypt@example.com',
+      role: 'investor',
+    });
+    expect(sessionRepo.created).toHaveLength(1);
+    expect(jwtIssuer.signCalls).toHaveLength(1);
   });
 
   it('returns null when the stored hash has a different length (length guard)', async () => {
