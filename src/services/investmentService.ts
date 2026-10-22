@@ -8,8 +8,7 @@ import { AMLService } from '../aml/amlService';
 import { TransactionContext } from '../aml/types';
 import { SanctionsScreeningService, SanctionsScreenResult } from './sanctionsScreeningService';
 import { sanitizeReviewLink } from '../lib/reviewLink';
-import { globalLogger } from '../lib/logger';
-import { globalMetrics } from '../lib/metrics';
+import { isPositiveDecimalAmount } from '../lib/amountValidation';
 
 /** Relative path to the OFAC dual-control review queue for compliance staff. */
 const OFAC_REVIEWS_ROUTE = '/api/v1/aml/ofac-reviews';
@@ -54,16 +53,25 @@ export class InvestmentService {
    * @throws Error if offering not found, invalid, or KYC-tier cap exceeded
    */
   async createInvestment(input: CreateInvestmentRequest): Promise<Investment> {
-    const db = this.db;
-    if (!db) {
-      throw new AppError(ErrorCode.INTERNAL_ERROR, 500, 'Database pool not available for transaction');
+    // Reject coercion-abuse inputs before database access or persistence.
+    if (!isPositiveDecimalAmount(input.amount)) {
+      throw Errors.validationError('Invalid amount: must be a positive decimal string');
     }
 
-    // Validate input before starting transaction
-    const amount = new Decimal(input.amount);
-    if (!amount.isPositive()) {
-      throw Errors.validationError('Invalid amount: must be a positive number');
+    // 1. Validate offering exists
+    const offering = await this.offeringRepo.findById(input.offering_id);
+    if (!offering) {
+      throw Errors.notFound(`Offering ${input.offering_id} not found`);
     }
+
+    // 2. Validate offering is active
+    const activeStatuses = ['active', 'open'];
+    if (!offering.status || !activeStatuses.includes(offering.status)) {
+      throw Errors.validationError(`Offering is not active. Current status: ${offering.status}`);
+    }
+
+    // 3. Validate amount
+    const amountNum = parseFloat(input.amount);
 
     if (!input.asset || input.asset.trim() === '') {
       throw Errors.validationError('Asset is required');

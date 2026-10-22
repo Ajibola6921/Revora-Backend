@@ -14,6 +14,41 @@ import { requireMobileAttestation } from '../security/mobileAttestation';
 import { AMLService, createAMLService } from '../aml/amlService';
 import { InMemorySecurityAuditRepository } from '../security/audit';
 import crypto from 'crypto';
+import { z } from 'zod';
+import { isPositiveDecimalAmount } from '../lib/amountValidation';
+
+const investmentBodySchema = z.object({
+  offering_id: z.string({ error: 'offering_id is required' }).uuid({
+    error: 'offering_id must be a valid UUID',
+  }),
+  amount: z.string({ error: 'amount is required' }).refine(
+    isPositiveDecimalAmount,
+    'amount must be a positive decimal string with up to 10 decimal places',
+  ),
+  asset: z.string({ error: 'asset is required' }).max(12, {
+    error: 'asset must be at most 12 characters',
+  }).trim().min(1, { error: 'asset is required' }),
+  beneficial_owners: z.array(z.string()).optional(),
+});
+
+function validateInvestmentBody(req: Request, res: Response, next: NextFunction): void {
+  const result = investmentBodySchema.safeParse(req.body);
+  if (!result.success) {
+    const fieldErrors = result.error.issues.reduce<Record<string, string[]>>((errors, issue) => {
+      const field = issue.path.join('.') || 'body';
+      (errors[field] ??= []).push(issue.message);
+      return errors;
+    }, {});
+    res.status(400).json({
+      error: result.error.issues[0].message,
+      details: fieldErrors,
+    });
+    return;
+  }
+
+  req.body = result.data;
+  next();
+}
 
 export const DEFAULT_INVESTMENT_IDEMPOTENCY_TTL_MS = 24 * 60 * 60 * 1000; // 24 hours
 
@@ -140,6 +175,7 @@ export function createInvestmentsRouter(db: Pool, deps: InvestmentsRouterDeps = 
     '/',
     requireInvestor,
     requireIdempotencyKey,
+    validateInvestmentBody,
     idempotencyMiddleware,
     requireMobileAttestation,
     async (req: Request, res: Response, next: NextFunction) => {
@@ -153,35 +189,12 @@ export function createInvestmentsRouter(db: Pool, deps: InvestmentsRouterDeps = 
     
     const investorId = String(authenticatedReq.user.id);
 
-    // Parse and validate request body
-    const body = req.body as Record<string, unknown>;
-    const offering_id = String(body.offering_id) || undefined;
-    const amount = String(body.amount) || undefined;
-    const asset = String(body.asset) || undefined;
-
-    // Optional beneficial-owner names to screen alongside the investor.
-    const beneficial_owners =
-      Array.isArray(body.beneficial_owners)
-        ? body.beneficial_owners
-            .filter((v): v is string => typeof v === 'string' && v.trim().length > 0)
-            .map((v) => v.trim())
-        : undefined;
-
-    // Validate required fields
-    if (!offering_id) {
-      res.status(400).json({ error: 'offering_id is required' });
-      return;
-    }
-
-    if (!amount) {
-      res.status(400).json({ error: 'amount is required' });
-      return;
-    }
-
-    if (!asset) {
-      res.status(400).json({ error: 'asset is required' });
-      return;
-    }
+    const { offering_id, amount, asset, beneficial_owners } = req.body as z.infer<
+      typeof investmentBodySchema
+    >;
+    const screenedBeneficialOwners = beneficial_owners
+      ?.map((owner) => owner.trim())
+      .filter((owner) => owner.length > 0);
 
     try {
       const investment = await investmentService.createInvestment({
@@ -189,7 +202,7 @@ export function createInvestmentsRouter(db: Pool, deps: InvestmentsRouterDeps = 
         offering_id,
         amount,
         asset,
-        beneficial_owners,
+        beneficial_owners: screenedBeneficialOwners,
       });
 
       res.status(201).json({ data: investment });

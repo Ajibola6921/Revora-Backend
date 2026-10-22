@@ -21,6 +21,7 @@ import {
 
 const SECRET =
   'test-secret-key-that-is-at-least-32-characters-long-for-route-tests!';
+const OFFERING_ID = '123e4567-e89b-42d3-a456-426614174000';
 
 /** Build a valid HS256 JWT without any external dependency. */
 function makeToken(payload: Record<string, unknown>): string {
@@ -181,7 +182,7 @@ function makeInvestmentRow(override: Partial<Investment> = {}): Investment {
   };
 }
 
-function mockQueryResult(rows: Investment[]): QueryResult<Investment> {
+function mockQueryResult(rows: unknown[]): QueryResult<any> {
   return { rows, rowCount: rows.length, command: 'SELECT', oid: 0, fields: [] };
 }
 
@@ -467,7 +468,7 @@ describe('POST /api/investments - Idempotency Protection', () => {
       `Bearer ${token}`,
       {},
       'POST',
-      { offering_id: 'off-1', amount: '1000.00', asset: 'USDC' }
+      { offering_id: OFFERING_ID, amount: '1000.00', asset: 'USDC' }
     );
 
     dispatchPost(router, req, res);
@@ -488,7 +489,7 @@ describe('POST /api/investments - Idempotency Protection', () => {
       `Bearer ${token}`,
       {},
       'POST',
-      { offering_id: 'off-1', amount: '1000.00', asset: 'USDC' },
+      { offering_id: OFFERING_ID, amount: '1000.00', asset: 'USDC' },
       { 'idempotency-key': '   ' }
     );
 
@@ -501,10 +502,114 @@ describe('POST /api/investments - Idempotency Protection', () => {
     });
   });
 
+  it('returns field-level 400 errors and does not create a row when asset is missing', async () => {
+    const token = makeToken({ sub: 'investor-123', role: 'investor' });
+    const router = createInvestmentsRouter(mockPool as unknown as Pool);
+    const res = makeMockRes();
+    const req = makeReq(
+      `Bearer ${token}`,
+      {},
+      'POST',
+      { offering_id: OFFERING_ID, amount: '1000.00' },
+      { 'idempotency-key': 'missing-asset-key' }
+    );
+
+    dispatchPost(router, req, res);
+    await flushPromises();
+
+    expect(res.status).toHaveBeenCalledWith(400);
+    expect(res.json).toHaveBeenCalledWith({
+      error: 'asset is required',
+      details: { asset: ['asset is required'] },
+    });
+    expect(mockPool.query).not.toHaveBeenCalled();
+  });
+
+  it('returns a field-level 400 error for a malformed offering UUID', async () => {
+    const token = makeToken({ sub: 'investor-123', role: 'investor' });
+    const router = createInvestmentsRouter(mockPool as unknown as Pool);
+    const res = makeMockRes();
+    const req = makeReq(
+      `Bearer ${token}`,
+      {},
+      'POST',
+      { offering_id: 'not-a-uuid', amount: '1000.00', asset: 'USDC' },
+      { 'idempotency-key': 'invalid-offering-key' }
+    );
+
+    dispatchPost(router, req, res);
+    await flushPromises();
+
+    expect(res.status).toHaveBeenCalledWith(400);
+    expect(res.json).toHaveBeenCalledWith({
+      error: 'offering_id must be a valid UUID',
+      details: { offering_id: ['offering_id must be a valid UUID'] },
+    });
+    expect(mockPool.query).not.toHaveBeenCalled();
+  });
+
+  it.each(['100abc', '1e6', ' 5'])(
+    'rejects malformed amount %j before database access',
+    async (amount) => {
+      const token = makeToken({ sub: 'investor-123', role: 'investor' });
+      const router = createInvestmentsRouter(mockPool as unknown as Pool);
+      const res = makeMockRes();
+      const req = makeReq(
+        `Bearer ${token}`,
+        {},
+        'POST',
+        { offering_id: OFFERING_ID, amount, asset: 'USDC' },
+        { 'idempotency-key': `invalid-amount-${amount}` }
+      );
+
+      dispatchPost(router, req, res);
+      await flushPromises();
+
+      const message = 'amount must be a positive decimal string with up to 10 decimal places';
+      expect(res.status).toHaveBeenCalledWith(400);
+      expect(res.json).toHaveBeenCalledWith({
+        error: message,
+        details: { amount: [message] },
+      });
+      expect(mockPool.query).not.toHaveBeenCalled();
+    }
+  );
+
+  it('validates asset length and beneficial-owner item types by field', async () => {
+    const token = makeToken({ sub: 'investor-123', role: 'investor' });
+    const router = createInvestmentsRouter(mockPool as unknown as Pool);
+    const res = makeMockRes();
+    const req = makeReq(
+      `Bearer ${token}`,
+      {},
+      'POST',
+      {
+        offering_id: OFFERING_ID,
+        amount: '1000.00',
+        asset: 'A'.repeat(13),
+        beneficial_owners: ['Jane Doe', 42],
+      },
+      { 'idempotency-key': 'invalid-field-types-key' }
+    );
+
+    dispatchPost(router, req, res);
+    await flushPromises();
+
+    expect(res.status).toHaveBeenCalledWith(400);
+    expect(res.json).toHaveBeenCalledWith({
+      error: 'asset must be at most 12 characters',
+      details: {
+        asset: ['asset must be at most 12 characters'],
+        'beneficial_owners.1': ['Invalid input: expected string, received number'],
+      },
+    });
+    expect(mockPool.query).not.toHaveBeenCalled();
+  });
+
   it('accepts POST request with valid Idempotency-Key', async () => {
     const investmentRow = makeInvestmentRow();
     mockPool.query
-      .mockResolvedValueOnce(mockQueryResult([{ id: 'off-1', status: 'active' }])) // offering check
+      .mockResolvedValueOnce(mockQueryResult([{ id: OFFERING_ID, status: 'active' }])) // offering check
       .mockResolvedValueOnce(mockQueryResult([investmentRow])); // insert
 
     const token = makeToken({ sub: 'investor-123', role: 'investor' });
@@ -514,7 +619,7 @@ describe('POST /api/investments - Idempotency Protection', () => {
       `Bearer ${token}`,
       {},
       'POST',
-      { offering_id: 'off-1', amount: '1000.00', asset: 'USDC' },
+      { offering_id: OFFERING_ID, amount: '1000.00', asset: 'USDC' },
       { 'idempotency-key': 'unique-key-123' }
     );
 
@@ -528,12 +633,12 @@ describe('POST /api/investments - Idempotency Protection', () => {
   it('returns cached response for duplicate Idempotency-Key with same body', async () => {
     const investmentRow = makeInvestmentRow({ id: 'inv-cached' });
     mockPool.query
-      .mockResolvedValueOnce(mockQueryResult([{ id: 'off-1', status: 'active' }]))
+      .mockResolvedValueOnce(mockQueryResult([{ id: OFFERING_ID, status: 'active' }]))
       .mockResolvedValueOnce(mockQueryResult([investmentRow]));
 
     const token = makeToken({ sub: 'investor-123', role: 'investor' });
-    const router = makeRouter();
-    const body = { offering_id: 'off-1', amount: '1000.00', asset: 'USDC' };
+    const router = createInvestmentsRouter(mockPool as unknown as Pool);
+    const body = { offering_id: OFFERING_ID, amount: '1000.00', asset: 'USDC' };
 
     // First request
     const res1 = makeMockRes();
@@ -571,7 +676,7 @@ describe('POST /api/investments - Idempotency Protection', () => {
   it('returns 409 conflict when Idempotency-Key is reused with different body', async () => {
     const investmentRow = makeInvestmentRow();
     mockPool.query
-      .mockResolvedValueOnce(mockQueryResult([{ id: 'off-1', status: 'active' }]))
+      .mockResolvedValueOnce(mockQueryResult([{ id: OFFERING_ID, status: 'active' }]))
       .mockResolvedValueOnce(mockQueryResult([investmentRow]));
 
     const token = makeToken({ sub: 'investor-123', role: 'investor' });
@@ -583,7 +688,7 @@ describe('POST /api/investments - Idempotency Protection', () => {
       `Bearer ${token}`,
       {},
       'POST',
-      { offering_id: 'off-1', amount: '1000.00', asset: 'USDC' },
+      { offering_id: OFFERING_ID, amount: '1000.00', asset: 'USDC' },
       { 'idempotency-key': 'conflict-key-789' }
     );
     dispatchPost(router, req1, res1);
@@ -597,7 +702,7 @@ describe('POST /api/investments - Idempotency Protection', () => {
       `Bearer ${token}`,
       {},
       'POST',
-      { offering_id: 'off-1', amount: '2000.00', asset: 'USDC' }, // Different amount
+      { offering_id: OFFERING_ID, amount: '2000.00', asset: 'USDC' }, // Different amount
       { 'idempotency-key': 'conflict-key-789' }
     );
     dispatchPost(router, req2, res2);
@@ -617,12 +722,12 @@ describe('POST /api/investments - Idempotency Protection', () => {
       resolveQuery = resolve;
     });
     mockPool.query
-      .mockResolvedValueOnce(mockQueryResult([{ id: 'off-1', status: 'active' }]))
+      .mockResolvedValueOnce(mockQueryResult([{ id: OFFERING_ID, status: 'active' }]))
       .mockReturnValueOnce(queryPromise);
 
     const token = makeToken({ sub: 'investor-123', role: 'investor' });
-    const router = makeRouter();
-    const body = { offering_id: 'off-1', amount: '1000.00', asset: 'USDC' };
+    const router = createInvestmentsRouter(mockPool as unknown as Pool);
+    const body = { offering_id: OFFERING_ID, amount: '1000.00', asset: 'USDC' };
 
     // First request (in-flight)
     const res1 = makeMockRes();
@@ -662,7 +767,7 @@ describe('POST /api/investments - Idempotency Protection', () => {
   it('fingerprints only relevant body fields (offering_id, amount, asset)', async () => {
     const investmentRow = makeInvestmentRow();
     mockPool.query
-      .mockResolvedValueOnce(mockQueryResult([{ id: 'off-1', status: 'active' }]))
+      .mockResolvedValueOnce(mockQueryResult([{ id: OFFERING_ID, status: 'active' }]))
       .mockResolvedValueOnce(mockQueryResult([investmentRow]));
 
     const token = makeToken({ sub: 'investor-123', role: 'investor' });
@@ -674,7 +779,7 @@ describe('POST /api/investments - Idempotency Protection', () => {
       `Bearer ${token}`,
       {},
       'POST',
-      { offering_id: 'off-1', amount: '1000.00', asset: 'USDC', extra: 'ignored' },
+      { offering_id: OFFERING_ID, amount: '1000.00', asset: 'USDC', extra: 'ignored' },
       { 'idempotency-key': 'fingerprint-key-111' }
     );
     dispatchPost(router, req1, res1);
@@ -688,7 +793,7 @@ describe('POST /api/investments - Idempotency Protection', () => {
       `Bearer ${token}`,
       {},
       'POST',
-      { offering_id: 'off-1', amount: '1000.00', asset: 'USDC' },
+      { offering_id: OFFERING_ID, amount: '1000.00', asset: 'USDC' },
       { 'idempotency-key': 'fingerprint-key-111' }
     );
     dispatchPost(router, req2, res2);
