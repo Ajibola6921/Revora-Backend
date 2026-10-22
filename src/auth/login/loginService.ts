@@ -6,7 +6,7 @@ import {
     SessionRepository,
     UserRepository,
 } from './types';
-import { hashSessionToken, SESSION_TTL_MS } from '../session';
+import { hashSessionToken, SESSION_TTL_MS, computeFamilyExpiresAt } from '../session';
 
 /**
  * Fixed hash used for the dummy password verification when no user is found.
@@ -86,6 +86,9 @@ export class LoginService {
             userId: user.id,
             tokenHash,
             expiresAt,
+            // Anchor the absolute family deadline at login so refresh rotation
+            // can never extend the family's total lifetime.
+            familyExpiresAt: computeFamilyExpiresAt(),
         });
 
         return {

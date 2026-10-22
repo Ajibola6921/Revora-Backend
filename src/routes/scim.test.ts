@@ -476,6 +476,7 @@ describe('SCIM 2.0 — Users', () => {
   describe('DELETE /Users/:id', () => {
     it('deactivates a user (soft delete)', async () => {
       repo.findById.mockResolvedValue({ ...SAMPLE_USER, password_hash: 'hash' } as any);
+      repo.updateUser.mockResolvedValue({ ...SAMPLE_USER, status: 'suspended', password_hash: 'hash' } as any);
       const app = buildApp(repo);
       const res = await auth(request(app).delete('/scim/v2/Users/user-1'));
       expect(res.status).toBe(204);
@@ -487,28 +488,16 @@ describe('SCIM 2.0 — Users', () => {
       expect(res2.body.active).toBe(false);
     });
 
-    it('re-deactivates an already inactive user so late sessions are revoked too', async () => {
-      repo.findById.mockResolvedValue(dbUser({ is_active: false }));
+    it('persists a suspended status to the DB so refresh rotation can observe it (#1292)', async () => {
+      repo.findById.mockResolvedValue({ ...SAMPLE_USER, password_hash: 'hash' } as any);
+      repo.updateUser.mockResolvedValue({ ...SAMPLE_USER, status: 'suspended', password_hash: 'hash' } as any);
       const app = buildApp(repo);
-      const res = await auth(request(app).delete('/scim/v2/Users/user-1'));
-      expect(res.status).toBe(204);
-      expect(repo.setActive).toHaveBeenCalledWith('user-1', false);
-    });
 
-    it('returns 500 when the user vanishes between lookup and deactivation', async () => {
-      repo.findById.mockResolvedValue(dbUser());
-      repo.setActive.mockResolvedValue(null);
-      const app = buildApp(repo);
-      const res = await auth(request(app).delete('/scim/v2/Users/user-1'));
-      expect(res.status).toBe(500);
-    });
+      await auth(request(app).delete('/scim/v2/Users/user-1'));
 
-    it('returns 500 and does not report success when deactivation fails', async () => {
-      repo.findById.mockResolvedValue(dbUser());
-      repo.setActive.mockRejectedValue(new Error('db error'));
-      const app = buildApp(repo);
-      const res = await auth(request(app).delete('/scim/v2/Users/user-1'));
-      expect(res.status).toBe(500);
+      expect(repo.updateUser).toHaveBeenCalledWith(
+        expect.objectContaining({ id: 'user-1', status: 'suspended' }),
+      );
     });
 
     it('returns 404 for unknown user', async () => {

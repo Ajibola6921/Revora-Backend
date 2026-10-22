@@ -166,6 +166,22 @@ export function createScimRouter(
   const router = Router();
   const authMiddleware = createScimAuth(scimToken);
 
+  /**
+   * Determine whether a user is de-provisioned.
+   *
+   * Two sources are consulted so the flag is correct both for the in-process
+   * fast path (`suspendedUsers`) and for users suspended before this process
+   * started or by another replica (persisted `status`).
+   */
+  function isSuspended(
+    userId: string,
+    existing?: { status?: unknown } | null,
+  ): boolean {
+    if (suspendedUsers.has(userId)) return true;
+    const status = existing?.status;
+    return typeof status === 'string' && status !== 'active' && status !== 'enabled';
+  }
+
   router.use(authMiddleware);
 
   function emitOp(operation: string, resource: string): void {
@@ -362,7 +378,7 @@ export function createScimRouter(
         users = [];
       }
 
-      const allResources = users.map(u => userToScim(u, isActive(u), baseUrl));
+      const allResources = users.map(u => userToScim(u, !isSuspended(u.id, u), baseUrl));
       const paged = allResources.slice(startIndex - 1, startIndex - 1 + count);
 
       const listResp: ScimListResponse = {
@@ -390,7 +406,7 @@ export function createScimRouter(
       const existing = await userRepo.findByEmail(userName);
       if (existing) {
         const { password_hash: _, ...safe } = existing;
-        const scim = userToScim(safe, isActive(existing), baseUrl);
+        const scim = userToScim(safe, !isSuspended(existing.id, existing), baseUrl);
         res.status(201).json(scim);
         return;
       }
@@ -428,7 +444,7 @@ export function createScimRouter(
         return;
       }
       const { password_hash: _, ...safe } = u;
-      res.json(userToScim(safe, isActive(u), baseUrl));
+      res.json(userToScim(safe, !isSuspended(u.id, u), baseUrl));
     } catch (err: any) {
       res.status(500).json(scimError(500, 'internal', err.message));
     }
@@ -450,17 +466,18 @@ export function createScimRouter(
         ? [givenName, familyName].filter(Boolean).join(' ')
         : (displayName || existing.name || '');
 
-      let active = isActive(existing);
-      if (body?.active !== undefined) {
-        const parsed = parseScimBoolean(body.active);
-        if (parsed === undefined) throw new InvalidActiveValueError();
-        active = parsed;
-      }
+      const active = body?.active !== undefined
+        ? body.active
+        : !isSuspended(existing.id, existing);
 
-      let updated = await userRepo.updateUser({
+      // Persist the de-provision so downstream authorisation (e.g. refresh
+      // rotation) observes the suspension without relying on this process's
+      // in-memory state.
+      const updated = await userRepo.updateUser({
         id: existing.id,
         email: body?.userName || existing.email,
         name: nameStr || undefined,
+        status: active ? 'active' : 'suspended',
       });
       updated = await applyActive(updated, active);
       const { password_hash: _, ...safe } = updated;
@@ -491,7 +508,7 @@ export function createScimRouter(
 
       let newEmail = existing.email;
       let newName = existing.name;
-      let newActive = isActive(existing);
+      let newActive = !isSuspended(existing.id, existing);
 
       for (const op of operations) {
         // op is case-insensitive (RFC 7644 3.5.2); Azure AD sends "Replace"
@@ -525,6 +542,7 @@ export function createScimRouter(
         id: existing.id,
         email: newEmail,
         name: newName,
+        status: newActive ? 'active' : 'suspended',
       });
       updated = await applyActive(updated, newActive);
       const { password_hash: _, ...safe } = updated;
@@ -550,8 +568,9 @@ export function createScimRouter(
         res.status(404).json(scimError(404, 'unknown', `User ${req.params.id} not found`));
         return;
       }
-      // Soft delete: keep the row, disable the account, revoke its sessions.
-      await applyActive(u, false);
+      // Soft-delete: persist a suspended status so refresh rotation fails closed.
+      await userRepo.updateUser({ id: u.id, status: 'suspended' });
+      suspendedUsers.add(u.id);
       res.status(204).send();
     } catch (err: any) {
       res.status(500).json(scimError(500, 'internal', err.message));
