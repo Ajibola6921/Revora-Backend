@@ -32,46 +32,49 @@ export class TenantSettingsRepository {
     return this.mapRow(result.rows[0]);
   }
 
-  async findByTenantIdForUpdate(
-    tenantId: string,
-    client: PoolClient,
-  ): Promise<TenantSettingsRow | null> {
-    await client.query(
-      `INSERT INTO tenant_settings (tenant_id, settings, session_policy, created_at, updated_at)
-       VALUES ($1, '{}'::jsonb, 'lax', NOW(), NOW())
-       ON CONFLICT (tenant_id) DO NOTHING`,
-      [tenantId],
-    );
-    const result: QueryResult = await client.query(
-      `SELECT tenant_id, settings, session_policy, created_at, updated_at
-       FROM tenant_settings
-       WHERE tenant_id = $1
-       LIMIT 1
-       FOR UPDATE`,
-      [tenantId],
-    );
-    return result.rows.length > 0 ? this.mapRow(result.rows[0]) : null;
-  }
-
-  async upsertSettings(
-    tenantId: string,
-    settings: Record<string, unknown>,
-    sessionPolicy: 'lax' | 'strict' = 'lax',
-    client: Pool | PoolClient = this.db,
-  ): Promise<TenantSettingsRow> {
-    const result: QueryResult = await client.query(
-      `INSERT INTO tenant_settings (tenant_id, settings, session_policy, created_at, updated_at)
-       VALUES ($1, $2, $3, NOW(), NOW())
+  /**
+   * Updates tenant settings without modifying the session policy.
+   * On conflict, only settings and updated_at are updated; session_policy is left untouched.
+   *
+   * @param tenantId Target tenant identifier
+   * @param settings Arbitrary settings dictionary to persist
+   * @returns Updated tenant settings record
+   */
+  async updateSettings(tenantId: string, settings: Record<string, unknown>): Promise<TenantSettingsRow> {
+    const result: QueryResult = await this.db.query(
+      `INSERT INTO tenant_settings (tenant_id, settings, created_at, updated_at)
+       VALUES ($1, $2, NOW(), NOW())
        ON CONFLICT (tenant_id)
-       DO UPDATE SET settings = $2, session_policy = $3, updated_at = NOW()
+       DO UPDATE SET settings = EXCLUDED.settings, updated_at = NOW()
        RETURNING tenant_id, settings, session_policy, created_at, updated_at`,
-      [tenantId, JSON.stringify(settings), sessionPolicy],
+      [tenantId, JSON.stringify(settings)],
     );
 
     return this.mapRow(result.rows[0]);
   }
 
-  private mapRow(row: any): TenantSettingsRow {
+  /**
+   * Sets the session policy for a tenant without modifying existing settings.
+   * On conflict, only session_policy and updated_at are updated; settings are left untouched.
+   *
+   * @param tenantId Target tenant identifier
+   * @param policy Desired session policy ('lax' | 'strict')
+   * @returns Updated tenant settings record
+   */
+  async setSessionPolicy(tenantId: string, policy: 'lax' | 'strict'): Promise<TenantSettingsRow> {
+    const result: QueryResult = await this.db.query(
+      `INSERT INTO tenant_settings (tenant_id, session_policy, created_at, updated_at)
+       VALUES ($1, $2, NOW(), NOW())
+       ON CONFLICT (tenant_id)
+       DO UPDATE SET session_policy = EXCLUDED.session_policy, updated_at = NOW()
+       RETURNING tenant_id, settings, session_policy, created_at, updated_at`,
+      [tenantId, policy],
+    );
+
+    return this.mapRow(result.rows[0]);
+  }
+
+  private mapRow(row: Record<string, unknown>): TenantSettingsRow {
     return {
       tenant_id: row.tenant_id,
       settings: row.settings ?? {},

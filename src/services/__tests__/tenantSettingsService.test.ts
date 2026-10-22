@@ -9,19 +9,13 @@ class MockTenantSettingsRepository {
     return this.store.get(tenantId) ?? null;
   }
 
-  async withTransaction<T>(callback: (client: any) => Promise<T>): Promise<T> {
-    return callback({});
-  }
-
-  async findByTenantIdForUpdate(tenantId: string): Promise<TenantSettingsRow | null> {
-    return this.findByTenantId(tenantId);
-  }
-
-  async upsertSettings(tenantId: string, settings: Record<string, unknown>): Promise<TenantSettingsRow> {
+  async updateSettings(tenantId: string, settings: Record<string, unknown>): Promise<TenantSettingsRow> {
+    const existing = this.store.get(tenantId);
     const row: TenantSettingsRow = {
       tenant_id: tenantId,
       settings,
-      created_at: new Date(),
+      session_policy: existing?.session_policy ?? 'lax',
+      created_at: existing?.created_at ?? new Date(),
       updated_at: new Date(),
     };
     this.store.set(tenantId, row);

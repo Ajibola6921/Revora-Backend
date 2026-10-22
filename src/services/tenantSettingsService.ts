@@ -72,18 +72,12 @@ export class TenantSettingsService {
       status: 'pending',
     };
 
-    await this.tenantSettingsRepo.withTransaction(async (client) => {
-      const row = await this.tenantSettingsRepo.findByTenantIdForUpdate(tenantId, client);
-      if (row?.settings?.pending_threshold_change) {
-        throw Errors.conflict('A sanctions threshold change is already pending');
-      }
-      await this.tenantSettingsRepo.upsertSettings(
-        tenantId,
-        { ...(row?.settings ?? {}), pending_threshold_change: pendingChange },
-        row?.session_policy ?? 'lax',
-        client,
-      );
-    });
+    const updatedSettings = {
+      ...currentSettings,
+      pending_threshold_change: pendingChange,
+    };
+
+    await this.tenantSettingsRepo.updateSettings(tenantId, updatedSettings);
 
     await this.auditRepo.record({
       id: `audit_${Date.now()}_${Math.random().toString(36).substring(2, 8)}`,
@@ -120,34 +114,31 @@ export class TenantSettingsService {
     approverUserId: string,
     requestId: string,
   ): Promise<TenantSettingsRow> {
-    const { pending, previousThreshold, updatedRow } =
-      await this.tenantSettingsRepo.withTransaction(async (client) => {
-        const row = await this.tenantSettingsRepo.findByTenantIdForUpdate(tenantId, client);
-        const pending = row?.settings?.pending_threshold_change as PendingThresholdChange | undefined;
-        if (!row || !pending || pending.status !== 'pending') {
-          throw new Error('No pending threshold change request found for tenant');
-        }
-        if (pending.id !== requestId) {
-          throw Errors.conflict('Pending threshold change request ID does not match');
-        }
-        if (pending.proposer_id === approverUserId) {
-          throw new Error('Dual-control security violation: Proposer cannot approve their own threshold change request');
-        }
-        const previousThreshold = typeof row.settings.sanctions_threshold === 'number'
-          ? row.settings.sanctions_threshold
-          : 0.85;
-        const updatedRow = await this.tenantSettingsRepo.upsertSettings(
-          tenantId,
-          {
-            ...row.settings,
-            sanctions_threshold: pending.proposed_threshold,
-            pending_threshold_change: null,
-          },
-          row.session_policy,
-          client,
-        );
-        return { pending, previousThreshold, updatedRow };
-      });
+    const row = await this.tenantSettingsRepo.findByTenantId(tenantId);
+    if (!row || !row.settings?.pending_threshold_change) {
+      throw new Error('No pending threshold change request found for tenant');
+    }
+
+    const pending = row.settings.pending_threshold_change as PendingThresholdChange;
+    if (pending.status !== 'pending') {
+      throw new Error(`Threshold change request is already ${pending.status}`);
+    }
+
+    // Dual-control check: Proposer cannot approve their own request!
+    if (pending.proposer_id === approverUserId) {
+      throw new Error('Dual-control security violation: Proposer cannot approve their own threshold change request');
+    }
+
+    const previousThreshold = typeof row.settings.sanctions_threshold === 'number' ? row.settings.sanctions_threshold : 0.85;
+    const newThreshold = pending.proposed_threshold;
+
+    const updatedSettings = {
+      ...row.settings,
+      sanctions_threshold: newThreshold,
+      pending_threshold_change: null, // Clear pending proposal
+    };
+
+    const updatedRow = await this.tenantSettingsRepo.updateSettings(tenantId, updatedSettings);
 
     await this.auditRepo.record({
       id: `audit_${Date.now()}_${Math.random().toString(36).substring(2, 8)}`,
@@ -185,23 +176,18 @@ export class TenantSettingsService {
     reason: string,
     requestId: string,
   ): Promise<TenantSettingsRow> {
-    const { pending, updatedRow } = await this.tenantSettingsRepo.withTransaction(async (client) => {
-      const row = await this.tenantSettingsRepo.findByTenantIdForUpdate(tenantId, client);
-      const pending = row?.settings?.pending_threshold_change as PendingThresholdChange | undefined;
-      if (!row || !pending || pending.status !== 'pending') {
-        throw new Error('No pending threshold change request found for tenant');
-      }
-      if (pending.id !== requestId) {
-        throw Errors.conflict('Pending threshold change request ID does not match');
-      }
-      const updatedRow = await this.tenantSettingsRepo.upsertSettings(
-        tenantId,
-        { ...row.settings, pending_threshold_change: null },
-        row.session_policy,
-        client,
-      );
-      return { pending, updatedRow };
-    });
+    const row = await this.tenantSettingsRepo.findByTenantId(tenantId);
+    if (!row || !row.settings?.pending_threshold_change) {
+      throw new Error('No pending threshold change request found for tenant');
+    }
+
+    const pending = row.settings.pending_threshold_change as PendingThresholdChange;
+    const updatedSettings = {
+      ...row.settings,
+      pending_threshold_change: null,
+    };
+
+    const updatedRow = await this.tenantSettingsRepo.updateSettings(tenantId, updatedSettings);
 
     await this.auditRepo.record({
       id: `audit_${Date.now()}_${Math.random().toString(36).substring(2, 8)}`,
@@ -270,18 +256,12 @@ export class TenantSettingsService {
       status: 'pending',
     };
 
-    await this.tenantSettingsRepo.withTransaction(async (client) => {
-      const row = await this.tenantSettingsRepo.findByTenantIdForUpdate(tenantId, client);
-      if (row?.settings?.pending_fx_quorum_change) {
-        throw Errors.conflict('An FX quorum configuration change is already pending');
-      }
-      await this.tenantSettingsRepo.upsertSettings(
-        tenantId,
-        { ...(row?.settings ?? {}), pending_fx_quorum_change: pending },
-        row?.session_policy ?? 'lax',
-        client,
-      );
-    });
+    const updatedSettings = {
+      ...currentSettings,
+      pending_fx_quorum_change: pending,
+    };
+
+    await this.tenantSettingsRepo.updateSettings(tenantId, updatedSettings);
 
     await this.auditRepo.record({
       id: `audit_${Date.now()}_${Math.random().toString(36).substring(2, 8)}`,
@@ -321,38 +301,31 @@ export class TenantSettingsService {
     approverUserId: string,
     requestId: string,
   ): Promise<TenantSettingsRow> {
-    const { pending, previousK, previousTolerance, updatedRow } =
-      await this.tenantSettingsRepo.withTransaction(async (client) => {
-        const row = await this.tenantSettingsRepo.findByTenantIdForUpdate(tenantId, client);
-        const pending = row?.settings?.pending_fx_quorum_change as PendingFxQuorumChange | undefined;
-        if (!row || !pending || pending.status !== 'pending') {
-          throw new Error('No pending FX quorum change request found for tenant');
-        }
-        if (pending.id !== requestId) {
-          throw Errors.conflict('Pending FX quorum change request ID does not match');
-        }
-        if (pending.proposer_id === approverUserId) {
-          throw new Error('Dual-control security violation: proposer cannot approve their own FX quorum change');
-        }
-        const previous = row.settings.fx_quorum as FxQuorumTenantConfig | undefined;
-        const previousK = previous?.k ?? DEFAULT_FX_QUORUM_CONFIG.k;
-        const previousTolerance = previous?.tolerance ?? DEFAULT_FX_QUORUM_CONFIG.tolerance;
-        const updatedRow = await this.tenantSettingsRepo.upsertSettings(
-          tenantId,
-          {
-            ...row.settings,
-            fx_quorum: {
-              k: pending.proposed_k,
-              tolerance: pending.proposed_tolerance,
-              reference: pending.proposed_reference,
-            },
-            pending_fx_quorum_change: null,
-          },
-          row.session_policy,
-          client,
-        );
-        return { pending, previousK, previousTolerance, updatedRow };
-      });
+    const row = await this.tenantSettingsRepo.findByTenantId(tenantId);
+    const pending = row?.settings?.pending_fx_quorum_change as PendingFxQuorumChange | undefined;
+    if (!pending || pending.status !== 'pending') {
+      throw new Error('No pending FX quorum change request found for tenant');
+    }
+
+    if (pending.proposer_id === approverUserId) {
+      throw new Error('Dual-control security violation: proposer cannot approve their own FX quorum change');
+    }
+
+    const previous = await this.getRawFxQuorumConfig(tenantId);
+    const previousK = previous?.k ?? DEFAULT_FX_QUORUM_CONFIG.k;
+    const previousTolerance = previous?.tolerance ?? DEFAULT_FX_QUORUM_CONFIG.tolerance;
+
+    const updatedSettings = {
+      ...row.settings,
+      fx_quorum: {
+        k: pending.proposed_k,
+        tolerance: pending.proposed_tolerance,
+        reference: pending.proposed_reference,
+      },
+      pending_fx_quorum_change: null,
+    };
+
+    const updatedRow = await this.tenantSettingsRepo.updateSettings(tenantId, updatedSettings);
 
     await this.auditRepo.record({
       id: `audit_${Date.now()}_${Math.random().toString(36).substring(2, 8)}`,
@@ -393,23 +366,18 @@ export class TenantSettingsService {
     reason: string,
     requestId: string,
   ): Promise<TenantSettingsRow> {
-    const { pending, updatedRow } = await this.tenantSettingsRepo.withTransaction(async (client) => {
-      const row = await this.tenantSettingsRepo.findByTenantIdForUpdate(tenantId, client);
-      const pending = row?.settings?.pending_fx_quorum_change as PendingFxQuorumChange | undefined;
-      if (!row || !pending || pending.status !== 'pending') {
-        throw new Error('No pending FX quorum change request found for tenant');
-      }
-      if (pending.id !== requestId) {
-        throw Errors.conflict('Pending FX quorum change request ID does not match');
-      }
-      const updatedRow = await this.tenantSettingsRepo.upsertSettings(
-        tenantId,
-        { ...row.settings, pending_fx_quorum_change: null },
-        row.session_policy,
-        client,
-      );
-      return { pending, updatedRow };
-    });
+    const row = await this.tenantSettingsRepo.findByTenantId(tenantId);
+    const pending = row?.settings?.pending_fx_quorum_change as PendingFxQuorumChange | undefined;
+    if (!pending || pending.status !== 'pending') {
+      throw new Error('No pending FX quorum change request found for tenant');
+    }
+
+    const updatedSettings = {
+      ...row.settings,
+      pending_fx_quorum_change: null,
+    };
+
+    const updatedRow = await this.tenantSettingsRepo.updateSettings(tenantId, updatedSettings);
 
     await this.auditRepo.record({
       id: `audit_${Date.now()}_${Math.random().toString(36).substring(2, 8)}`,
