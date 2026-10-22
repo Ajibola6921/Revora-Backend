@@ -1,100 +1,138 @@
-/**
- * src/index.test.ts
- *
- * Tests for:
- *   1. Utility functions exported from src/index.ts (parseMoneyString, etc.)
- *   2. Auth route wiring: login, refresh, logout, change-password are all
- *      reachable from the createApp() factory — i.e., NOT 404.
- *   3. Auth route e2e flow: login → protected route → refresh → logout.
- *   4. Route enumeration: enumerateRoutes() lists the auth routes.
- *
- * Isolation strategy
- * ──────────────────
- * The test uses jest.mock() to prevent real PostgreSQL connections. Auth
- * services are exercised through their handlers; the underlying repositories
- * are replaced with deterministic in-memory fakes via jest.mock so that the
- * tests run without a database.
- *
- * Security coverage
- * ─────────────────
- * • POST /api/auth/login with empty body → 400 (not 404).
- * • POST /api/auth/login with invalid credentials → 401.
- * • POST /api/auth/login with valid credentials → 200 + tokens.
- * • GET  /api/v1/vesting/claim (protected route) without token → 401.
- * • GET  /api/v1/vesting/claim with access token → not 404.
- * • POST /api/auth/refresh with valid refresh token → 200 + new tokens.
- * • POST /api/auth/logout with valid session → 204.
- * • POST /api/v1/users/me/change-password with empty body → 400 (not 404).
- * • Route enumerator lists all auth routes.
- */
+import { parseMoneyString } from "./index";
+import supertest from "supertest";
+import { createApp } from "./index";
+import { issueToken } from "./lib/jwt";
+import { hashSessionToken } from "./auth/session";
 
-// ── Module-level mocks (hoisted before any imports) ───────────────────────────
+describe("src/index.ts", () => {
+  describe("distribution and payout routes", () => {
+    const jwtSecret = "test-secret-for-distribution-route-tests";
+    const issuerId = "issuer-test";
+    const investorId = "investor-test";
 
-// Prevent real PostgreSQL pool construction.
-jest.mock('./db/pool', () => ({
-  pool: {
-    query: jest.fn(),
-    connect: jest.fn(),
-    end: jest.fn(),
-  },
-}));
+    beforeAll(() => {
+      process.env.JWT_SECRET = jwtSecret;
+    });
 
-// Prevent real DB client usage.
-jest.mock('./db/client', () => ({
-  query: jest.fn(),
-  dbHealth: jest.fn().mockResolvedValue({ healthy: true, latencyMs: 1 }),
-  closePool: jest.fn(),
-}));
+    function appWithFakes() {
+      const sessions = new Map<string, { id: string; user_id: string; token_hash: string; expires_at: Date }>();
+      const tokenFor = (userId: string, role: string) => {
+        const sessionId = `${role}-session`;
+        const token = issueToken({
+          subject: userId,
+          additionalPayload: { sid: sessionId, role },
+        });
+        sessions.set(sessionId, {
+          id: sessionId,
+          user_id: userId,
+          token_hash: hashSessionToken(token),
+          expires_at: new Date(Date.now() + 60_000),
+        });
+        return token;
+      };
 
-// Isolate the email service so it never tries to connect.
-jest.mock('./services/emailService', () => ({
-  emailService: {
-    sendPasswordResetEmail: jest.fn(),
-    setDeliverabilityService: jest.fn(),
-  },
-}));
+      const issuerToken = tokenFor(issuerId, "startup");
+      const investorToken = tokenFor(investorId, "investor");
+      const app = createApp({
+        sessionRepository: {
+          findById: async (id) => sessions.get(id) ?? null,
+        },
+        distributionOfferingRepo: {
+          getById: async (id) =>
+            id === "offering-1"
+              ? { id, issuer_id: issuerId }
+              : null,
+        },
+        distributionEngine: {
+          distribute: jest.fn(),
+          previewRun: jest.fn().mockResolvedValue({
+            preview_id: "preview-1",
+            offering_id: "offering-1",
+            period_id: "2026-01",
+            revenue_amount: "100",
+            computed_at: "2026-01-31T00:00:00.000Z",
+            investor_count: 1,
+            projections: [{ investor_id: investorId, amount: "100.00" }],
+          }),
+        },
+        payoutRepo: {
+          listPayoutsByInvestor: async (id) =>
+            id === investorId
+              ? [{
+                  id: "payout-1",
+                  distribution_run_id: "run-1",
+                  investor_id: investorId,
+                  amount: "100.00",
+                  status: "processed",
+                  created_at: new Date("2026-01-31T00:00:00.000Z"),
+                  updated_at: new Date("2026-01-31T00:00:00.000Z"),
+                }]
+              : [],
+        },
+      });
 
-// Social token verifiers need real JWKS — replace with a stub that rejects
-// all tokens so tests that exercise social-login get deterministic 401s.
-jest.mock('./auth/social/providerVerifiers', () => ({
-  createDefaultSocialTokenVerifierFromEnv: () => ({
-    verify: jest.fn().mockRejectedValue(new Error('provider not configured in tests')),
-  }),
-}));
+      return { app, issuerToken, investorToken };
+    }
 
-// OfacSanctionsLoader performs HTTP requests on init — suppress.
-jest.mock('./services/ofacSanctionsLoader', () => ({
-  OfacSanctionsLoader: jest.fn().mockImplementation(() => ({
-    load: jest.fn().mockResolvedValue([]),
-    start: jest.fn(),
-    stop: jest.fn(),
-  })),
-}));
+    it("serves a distribution preview to the authenticated offering issuer", async () => {
+      const { app, issuerToken } = appWithFakes();
 
-// ── Real imports ──────────────────────────────────────────────────────────────
+      const response = await supertest(app)
+        .post("/api/v1/offerings/offering-1/distribute/preview")
+        .set("Authorization", `Bearer ${issuerToken}`)
+        .send({
+          revenue_amount: "100",
+          period: {
+            id: "2026-01",
+            start: "2026-01-01T00:00:00.000Z",
+            end: "2026-01-31T00:00:00.000Z",
+          },
+        });
 
-import { createHash } from 'node:crypto';
-import request from 'supertest';
-import { createApp, parseMoneyString } from './index';
-import { closePool } from './db/client';
-import { enumerateRoutes } from './security/routeEnumerator';
+      expect(response.status).toBe(200);
+      expect(response.body.preview_id).toBe("preview-1");
+    });
 
-// ── Shared constants ──────────────────────────────────────────────────────────
+    it("requires a valid session-backed token for distribution previews", async () => {
+      const { app } = appWithFakes();
 
-const API_AUTH = '/api/auth';
-const API_V1 = '/api/v1';
+      const response = await supertest(app)
+        .post("/api/v1/offerings/offering-1/distribute/preview")
+        .send({
+          revenue_amount: "100",
+          period: {
+            start: "2026-01-01T00:00:00.000Z",
+            end: "2026-01-31T00:00:00.000Z",
+          },
+        });
 
-afterAll(async () => {
-  await closePool();
-});
+      expect(response.status).toBe(401);
+    });
 
-// =============================================================================
-// Section 1 – parseMoneyString (existing utility coverage)
-// =============================================================================
+    it("requires a valid session-backed token to list payouts", async () => {
+      const { app } = appWithFakes();
 
-describe('src/index.ts', () => {
-  describe('parseMoneyString', () => {
-    it('returns null for non-string values', () => {
+      const response = await supertest(app).get("/api/v1/investments/payouts");
+
+      expect(response.status).toBe(401);
+    });
+
+    it("lists only the authenticated investor's payouts", async () => {
+      const { app, investorToken } = appWithFakes();
+
+      const response = await supertest(app)
+        .get("/api/v1/investments/payouts")
+        .set("Authorization", `Bearer ${investorToken}`);
+
+      expect(response.status).toBe(200);
+      expect(response.body.payouts).toHaveLength(1);
+      expect(response.body.payouts[0].investor_id).toBe(investorId);
+    });
+  });
+
+  describe("parseMoneyString", () => {
+    it("should return null for non-string values", () => {
+      // Evidence: if (typeof value !== "string") return null;
       expect(parseMoneyString(123)).toBeNull();
       expect(parseMoneyString(undefined)).toBeNull();
       expect(parseMoneyString(null)).toBeNull();

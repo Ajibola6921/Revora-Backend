@@ -81,6 +81,12 @@ export interface ScheduleConfig {
   timezone: string;
 }
 
+type ScheduledDistributionRepo = Pick<
+  ScheduledDistributionRepository,
+  'create' | 'findByOffering' | 'findAll' | 'markCancelled'
+>;
+type DistributionState = Pick<DistributionStateManager, 'pause' | 'resume'>;
+
 // ─── Handlers ─────────────────────────────────────────────────────────────────
 
 /**
@@ -103,12 +109,11 @@ function parseAmountField(raw: unknown, field: string): string {
 export function createDistributionHandlers(
   distributionEngine: any,
   offeringRepo?: OfferingRepo,
-  distributionStateManager?: DistributionStateManager,
+  distributionStateManager?: DistributionState,
   auditRepository?: SecurityAuditRepository,
   distributionAccountRepo?: DistributionAccountRepo,
   accountingLedger?: AccountingLedgerService,
-  scheduledDistributionRepo?: ScheduledDistributionRepository,
-  revenueReportRepo?: RevenueReportRepo,
+  scheduledDistributionRepo?: ScheduledDistributionRepo,
 ) {
   async function triggerDistribution(req: Request, res: Response, next: NextFunction) {
     const requestId = (req as any).id;
@@ -619,7 +624,7 @@ export function createDistributionHandlers(
 
   // ─── Deferred distribution scheduling ────────────────────────────────────────
 
-  function requireScheduleRepo(): ScheduledDistributionRepository {
+  function requireScheduleRepo(): ScheduledDistributionRepo {
     if (!scheduledDistributionRepo) {
       throw Errors.internal('Scheduled distribution repository not available');
     }
@@ -837,12 +842,11 @@ export default function createDistributionsRouter(opts: {
   distributionEngine: any;
   offeringRepo?: OfferingRepo;
   verifyJWT: express.RequestHandler;
-  distributionStateManager?: DistributionStateManager;
+  distributionStateManager?: DistributionState;
   auditRepository?: SecurityAuditRepository;
   distributionAccountRepo?: DistributionAccountRepo;
   accountingLedger?: AccountingLedgerService;
-  scheduledDistributionRepo?: ScheduledDistributionRepository;
-  revenueReportRepo?: RevenueReportRepo;
+  scheduledDistributionRepo?: ScheduledDistributionRepo;
 }) {
   const router = express.Router();
   const handlers = createDistributionHandlers(
