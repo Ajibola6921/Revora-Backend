@@ -9,6 +9,9 @@ import { TransactionContext } from '../aml/types';
 import { SanctionsScreeningService, SanctionsScreenResult } from './sanctionsScreeningService';
 import { sanitizeReviewLink } from '../lib/reviewLink';
 import { isPositiveDecimalAmount } from '../lib/amountValidation';
+import { Decimal } from '../lib/decimal';
+import { globalLogger } from '../lib/logger';
+import { globalMetrics } from '../lib/metrics';
 
 /** Relative path to the OFAC dual-control review queue for compliance staff. */
 const OFAC_REVIEWS_ROUTE = '/api/v1/aml/ofac-reviews';
@@ -17,7 +20,6 @@ import {
   evaluateInvestmentAgainstCap,
   parseKycRiskTier,
   resolveEffectiveCap,
-  CapResolution,
   KycRiskTier,
 } from '../lib/kycRiskTierCaps';
 
@@ -44,77 +46,134 @@ export class InvestmentService {
     private amlService?: AMLService,
     private userRepo?: UserRepository,
     private db?: Pool,
+    private screeningService?: SanctionsScreeningService,
+    private auditLogRepo?: AuditLogRepository,
   ) {}
 
   /**
    * Create a new investment
    * @param input Investment data
    * @returns Created investment
-   * @throws Error if offering not found, invalid, or KYC-tier cap exceeded
+   * @throws Error if offering not found, invalid, sanctions-blocked or KYC-tier cap exceeded
    */
   async createInvestment(input: CreateInvestmentRequest): Promise<Investment> {
     // Reject coercion-abuse inputs before database access or persistence.
-    if (!isPositiveDecimalAmount(input.amount)) {
+    if (typeof input.amount !== 'string' || !isPositiveDecimalAmount(input.amount)) {
       throw Errors.validationError('Invalid amount: must be a positive decimal string');
     }
-
-    // 1. Validate offering exists
-    const offering = await this.offeringRepo.findById(input.offering_id);
-    if (!offering) {
-      throw Errors.notFound(`Offering ${input.offering_id} not found`);
-    }
-
-    // 2. Validate offering is active
-    const activeStatuses = ['active', 'open'];
-    if (!offering.status || !activeStatuses.includes(offering.status)) {
-      throw Errors.validationError(`Offering is not active. Current status: ${offering.status}`);
-    }
-
-    // 3. Validate amount
-    const amountNum = parseFloat(input.amount);
+    const amount = new Decimal(input.amount);
 
     if (!input.asset || input.asset.trim() === '') {
       throw Errors.validationError('Asset is required');
     }
 
-    // Run the entire operation in a single transaction with advisory lock
-    const client = await db.connect();
+    // Without a pool (lightweight / legacy wiring) run the same checks without
+    // the serialising transaction.
+    if (!this.db) {
+      const investment = await this.validateAndPersist(input, amount);
+      await this.runAmlMonitoring(investment);
+      return investment;
+    }
+
+    // Run the cap check + insert in a single transaction guarded by an advisory
+    // lock so concurrent submissions cannot jointly exceed the cap.
+    const client = await this.db.connect();
+    let investment: Investment;
     try {
       await client.query('BEGIN');
-
-      // 1. Acquire advisory lock for this investor+offering pair to serialize concurrent cap checks
-      // This must be done early to prevent race conditions on the cap check
       await this.investmentRepo.acquireInvestorOfferingLock(client, input.investor_id, input.offering_id);
-
-      // 2. Validate offering exists and is active (inside transaction for consistency)
-      const offering = await this.offeringRepo.findById(input.offering_id, client);
-      if (!offering) {
+      investment = await this.validateAndPersist(input, amount, client);
+      await client.query('COMMIT');
+    } catch (error) {
+      try {
         await client.query('ROLLBACK');
-        throw Errors.notFound(`Offering ${input.offering_id} not found`);
+      } catch {
+        // Ignore rollback errors
       }
+      throw error;
+    } finally {
+      client.release();
+    }
 
-      const activeStatuses = ['active', 'open'];
-      if (!offering.status || !activeStatuses.includes(offering.status)) {
-        await client.query('ROLLBACK');
-        throw Errors.validationError(`Offering is not active. Current status: ${offering.status}`);
+    // Run AML transaction monitoring outside the transaction.
+    await this.runAmlMonitoring(investment);
+    return investment;
+  }
+
+  /**
+   * Validate the offering, enforce the KYC-tier cap, run sanctions screening and
+   * persist the investment (using `client` when inside a transaction).
+   */
+  private async validateAndPersist(
+    input: CreateInvestmentRequest,
+    amount: Decimal,
+    client?: PoolClient,
+  ): Promise<Investment> {
+    // 1. Validate offering exists and is active
+    const offering = await this.offeringRepo.findById(input.offering_id, client);
+    if (!offering) {
+      throw Errors.notFound(`Offering ${input.offering_id} not found`);
+    }
+
+    const activeStatuses = ['active', 'open'];
+    if (!offering.status || !activeStatuses.includes(offering.status)) {
+      throw Errors.validationError(`Offering is not active. Current status: ${offering.status}`);
+    }
+
+    // 2. KYC risk-tier dynamic cap
+    const tier = await this.resolveInvestorTier(input.investor_id, client);
+    const offeringCapBps = this.parseOfferingCapBps(offering);
+    const resolution = resolveEffectiveCap(offeringCapBps, tier);
+
+    if (resolution.effectiveCapBps != null) {
+      const totalOfferingAmount = this.parseTotalOfferingAmount(offering);
+      const existingTotalStr = await this.investmentRepo.sumInvestorCommitment(
+        input.investor_id,
+        input.offering_id,
+        client,
+      );
+      const existingTotal = new Decimal(existingTotalStr);
+
+      const check = evaluateInvestmentAgainstCap({
+        existingTotal,
+        newAmount: amount,
+        totalOfferingAmount,
+        resolution,
+      });
+
+      if (!check.allowed) {
+        throw new AppError(ErrorCode.FORBIDDEN, 403, check.reason, {
+          kyc_risk_tier: resolution.tier,
+          effective_cap_bps: resolution.effectiveCapBps,
+          offering_cap_bps: resolution.offeringCapBps,
+          existing_total: check.existingTotal.toString(),
+          attempted_amount: check.newAmount.toString(),
+          cap_amount: check.capAmount.toString(),
+        });
       }
+    }
 
-      // 3. Resolve KYC tier and effective cap
-      const tier = await this.resolveInvestorTier(input.investor_id, client);
-      const offeringCapBps = this.parseOfferingCapBps(offering);
-      const resolution = resolveEffectiveCap(offeringCapBps, tier);
-
-      // 4. If unlimited after tier resolution, skip cap check
-      if (resolution.effectiveCapBps != null) {
-        const totalOfferingAmount = this.parseTotalOfferingAmount(offering);
-        const existingTotalStr = await this.investmentRepo.sumInvestorCommitment(
-          input.investor_id,
-          input.offering_id,
-          client,
+    // 3. OFAC / EU / UK sanctions screening (blocking, fail-closed) before persistence
+    const screening = await this.screenInvestment(input);
+    if (screening && !screening.cleared) {
+      // Failure to obtain a verified list, or a confirmed hit -> reject.
+      const blocked = screening.matches.length > 0;
+      await this.recordScreenBlocked(input, screening, blocked);
+      if (blocked) {
+        throw new AppError(
+          ErrorCode.FORBIDDEN,
+          403,
+          'Investment blocked: investor or beneficial owner matched a sanctions list entry.',
+          this.screeningDetails(screening),
         );
-        const existingTotal = new Decimal(existingTotalStr);
+      }
+      throw Errors.serviceUnavailable(
+        'Investment blocked: sanctions list unavailable; screening could not complete (fail-closed).',
+        this.screeningDetails(screening),
+      );
+    }
 
-    // 7. Create investment record
+    // 4. Create investment record
     const investmentInput: CreateInvestmentInput = {
       investor_id: input.investor_id,
       offering_id: input.offering_id,
@@ -136,42 +195,121 @@ export class InvestmentService {
       };
     }
 
-    const investment = await this.investmentRepo.create(investmentInput);
+    return this.investmentRepo.create(investmentInput, client);
+  }
 
-    // 7. Run AML transaction monitoring if service is available
-    if (this.amlService) {
-      // Resolve the investor's display name so name-based rules (sanctions_screening,
-      // geo_mismatch) receive a real name rather than a UUID.
-      const investorName = await this.resolveInvestorName(investment.investor_id);
+  /**
+   * Fire-and-forget AML evaluation: a rules-engine hiccup never fails the
+   * investor's submission. Failures are surfaced via structured logging and the
+   * aml_evaluation_failures_total counter.
+   */
+  private async runAmlMonitoring(investment: Investment): Promise<void> {
+    const amlService = this.amlService;
+    if (!amlService) return;
 
-      const context: TransactionContext = {
+    const recordFailure = (error: unknown): void => {
+      globalLogger.error('AML evaluation failed', {
         investment_id: investment.id,
         investor_id: investment.investor_id,
-        offering_id: investment.offering_id,
-        amount: investment.amount,
-        asset: investment.asset,
-        timestamp: investment.created_at,
-        investor_name: investorName,
-      };
-
-      // Fire-and-forget: AML evaluation is non-blocking so that a rules-engine
-      // hiccup never fails the investor's submission. All failures are surfaced
-      // via structured logging and the aml_evaluation_failures_total counter so
-      // they are visible in dashboards and alerts without silently swallowing them.
-      this.amlService.evaluateTransaction(context).catch((error: unknown) => {
-        globalLogger.error('AML evaluation failed', {
-          investment_id: investment.id,
-          investor_id: investment.investor_id,
-          error: error instanceof Error ? error.message : String(error),
-        });
-        globalMetrics.incrementCounter(
-          'aml_evaluation_failures_total',
-          { reason: 'evaluation_error' },
-          1,
-          'Total number of AML evaluation failures on investment creation',
-        );
+        error: error instanceof Error ? error.message : String(error),
       });
+      globalMetrics.incrementCounter(
+        'aml_evaluation_failures_total',
+        { reason: 'evaluation_error' },
+        1,
+        'Total number of AML evaluation failures on investment creation',
+      );
+    };
+
+    // Resolve the investor's display name so name-based rules (sanctions_screening,
+    // geo_mismatch) receive a real name rather than a UUID.
+    let investorName = investment.investor_id;
+    try {
+      investorName = await this.resolveInvestorName(investment.investor_id);
+    } catch {
+      // Fall back to the investor id; monitoring must never block the submission.
     }
+
+    const context: TransactionContext = {
+      investment_id: investment.id,
+      investor_id: investment.investor_id,
+      offering_id: investment.offering_id,
+      amount: investment.amount,
+      asset: investment.asset,
+      timestamp: investment.created_at,
+      investor_name: investorName,
+    };
+
+    try {
+      amlService.evaluateTransaction(context).catch(recordFailure);
+    } catch (error) {
+      recordFailure(error);
+    }
+  }
+
+  /**
+   * Run sanctions screening for the investor and any known beneficial owners.
+   * Returns null when no screening service is configured (opt-in).
+   */
+  private async screenInvestment(
+    input: CreateInvestmentRequest,
+  ): Promise<SanctionsScreenResult | null> {
+    if (!this.screeningService) return null;
+
+    const name = await this.resolveInvestorName(input.investor_id);
+    const identityNames = [name, ...(input.beneficial_owners ?? [])]
+      .filter((n) => typeof n === 'string' && n.trim().length > 0);
+
+    return this.screeningService.screen(identityNames);
+  }
+
+  /** Resolve the investor's display name via the user repository (if available). */
+  private async resolveInvestorName(investorId: string): Promise<string> {
+    if (this.userRepo) {
+      const user = await this.userRepo.findById(investorId);
+      if (user?.name) return user.name;
+    }
+    return investorId;
+  }
+
+  /**
+   * Persist an audit-log entry describing a blocked (or fail-closed) submission
+   * with the reason and a reviewer queue link for the OFAC dual-control queue.
+   */
+  private async recordScreenBlocked(
+    input: CreateInvestmentRequest,
+    screening: SanctionsScreenResult,
+    blocked: boolean,
+  ): Promise<void> {
+    if (!this.auditLogRepo) return;
+    const reviewerLink = sanitizeReviewLink(OFAC_REVIEWS_ROUTE);
+    const details: Record<string, unknown> = {
+      investor_id: input.investor_id,
+      offering_id: input.offering_id,
+      amount: input.amount,
+      asset: input.asset,
+      screening_status: blocked ? 'blocked' : 'error',
+      versions: screening.versions,
+      matches: screening.matches,
+      reviewer_queue_link: reviewerLink,
+      blocked,
+    };
+    await this.auditLogRepo.createAuditLog({
+      user_id: input.investor_id,
+      action: 'investment_sanctions_screening_blocked',
+      resource: `investment_offering/${input.offering_id}`,
+      details: JSON.stringify(details),
+      ip_address: null,
+      user_agent: 'investment-service',
+    });
+  }
+
+  private screeningDetails(screening: SanctionsScreenResult): Record<string, unknown> {
+    return {
+      cleared: screening.cleared,
+      matches: screening.matches,
+      versions: screening.versions,
+    };
   }
 
   /**
@@ -222,5 +360,7 @@ export function createInvestmentService(
     amlService,
     new UserRepository(db),
     db,
+    screeningService,
+    auditLogRepo,
   );
 }

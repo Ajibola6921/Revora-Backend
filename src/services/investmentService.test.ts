@@ -482,7 +482,7 @@ describe('InvestmentService sanctions screening', () => {
     const userRepo = {
       findById: jest.fn().mockResolvedValue(makeUser({ name: 'Jane Doe' })),
     } as unknown as UserRepository;
-    const svc = new InvestmentService(invRepo, offRepo, undefined, userRepo, screening, audit);
+    const svc = new InvestmentService(invRepo, offRepo, undefined, userRepo, undefined, screening, audit);
 
     const offeringRow = makeOfferingRow({ status: 'active' });
     if (opts.repoMatches) {
