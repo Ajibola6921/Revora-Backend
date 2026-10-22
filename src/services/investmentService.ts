@@ -6,7 +6,13 @@ import { AuditLogRepository } from '../db/repositories/auditLogRepository';
 import { Errors, AppError, ErrorCode } from '../lib/errors';
 import { AMLService } from '../aml/amlService';
 import { TransactionContext } from '../aml/types';
-import { Decimal } from '../lib/decimal';
+import { SanctionsScreeningService, SanctionsScreenResult } from './sanctionsScreeningService';
+import { sanitizeReviewLink } from '../lib/reviewLink';
+import { globalLogger } from '../lib/logger';
+import { globalMetrics } from '../lib/metrics';
+
+/** Relative path to the OFAC dual-control review queue for compliance staff. */
+const OFAC_REVIEWS_ROUTE = '/api/v1/aml/ofac-reviews';
 import {
   DEFAULT_KYC_RISK_TIER,
   evaluateInvestmentAgainstCap,
@@ -100,71 +106,63 @@ export class InvestmentService {
         );
         const existingTotal = new Decimal(existingTotalStr);
 
-        const check = evaluateInvestmentAgainstCap({
-          existingTotal,
-          newAmount: amount,
-          totalOfferingAmount,
-          resolution,
-        });
+    // 7. Create investment record
+    const investmentInput: CreateInvestmentInput = {
+      investor_id: input.investor_id,
+      offering_id: input.offering_id,
+      amount: input.amount,
+      asset: input.asset,
+      status: 'pending', // Default status until Stellar transaction is submitted
+    };
 
-        if (!check.allowed) {
-          await client.query('ROLLBACK');
-          throw new AppError(ErrorCode.FORBIDDEN, 403, check.reason, {
-            kyc_risk_tier: resolution.tier,
-            effective_cap_bps: resolution.effectiveCapBps,
-            offering_cap_bps: resolution.offeringCapBps,
-            existing_total: check.existingTotal.toString(),
-            attempted_amount: check.newAmount.toString(),
-            cap_amount: check.capAmount.toString(),
-          });
-        }
-      }
+    if (screening) {
+      investmentInput.screening_status = 'passed';
+      investmentInput.screening_list_version =
+        screening.versions['ofac'] ?? null;
+      investmentInput.screening_result = {
+        complete: screening.complete,
+        cleared: true,
+        matches: [],
+        versions: screening.versions,
+        screened_at: new Date().toISOString(),
+      };
+    }
 
-      // 5. Create investment record (inside same transaction)
-      const investmentInput: CreateInvestmentInput = {
-        investor_id: input.investor_id,
-        offering_id: input.offering_id,
-        amount: input.amount,
-        asset: input.asset,
-        status: 'pending',
+    const investment = await this.investmentRepo.create(investmentInput);
+
+    // 7. Run AML transaction monitoring if service is available
+    if (this.amlService) {
+      // Resolve the investor's display name so name-based rules (sanctions_screening,
+      // geo_mismatch) receive a real name rather than a UUID.
+      const investorName = await this.resolveInvestorName(investment.investor_id);
+
+      const context: TransactionContext = {
+        investment_id: investment.id,
+        investor_id: investment.investor_id,
+        offering_id: investment.offering_id,
+        amount: investment.amount,
+        asset: investment.asset,
+        timestamp: investment.created_at,
+        investor_name: investorName,
       };
 
-      const investment = await this.investmentRepo.create(investmentInput, client);
-
-      await client.query('COMMIT');
-
-      // 6. Run AML transaction monitoring if service is available (outside transaction)
-      if (this.amlService) {
-        try {
-          const context: TransactionContext = {
-            investment_id: investment.id,
-            investor_id: investment.investor_id,
-            offering_id: investment.offering_id,
-            amount: investment.amount,
-            asset: investment.asset,
-            timestamp: investment.created_at,
-          };
-
-          // Run AML evaluation asynchronously (non-blocking)
-          this.amlService.evaluateTransaction(context).catch(error => {
-            console.error('AML evaluation failed:', error);
-          });
-        } catch (error) {
-          console.error('AML evaluation setup failed:', error);
-        }
-      }
-
-      return investment;
-    } catch (error) {
-      // Ensure rollback on any error
-      try {
-        await client.query('ROLLBACK');
-      } catch {
-        // Ignore rollback errors
-      }
-      throw error;
-    } finally {
-      client.release();
+      // Fire-and-forget: AML evaluation is non-blocking so that a rules-engine
+      // hiccup never fails the investor's submission. All failures are surfaced
+      // via structured logging and the aml_evaluation_failures_total counter so
+      // they are visible in dashboards and alerts without silently swallowing them.
+      this.amlService.evaluateTransaction(context).catch((error: unknown) => {
+        globalLogger.error('AML evaluation failed', {
+          investment_id: investment.id,
+          investor_id: investment.investor_id,
+          error: error instanceof Error ? error.message : String(error),
+        });
+        globalMetrics.incrementCounter(
+          'aml_evaluation_failures_total',
+          { reason: 'evaluation_error' },
+          1,
+          'Total number of AML evaluation failures on investment creation',
+        );
+      });
     }
   }
 

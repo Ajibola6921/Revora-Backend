@@ -2,7 +2,7 @@ import { Router, Request, Response, NextFunction } from 'express';
 import { Pool } from 'pg';
 import { InvestmentRepository } from '../db/repositories/investmentRepository';
 import { requireInvestor, AuthenticatedRequest } from '../middleware/auth';
-import { InvestmentService, createInvestmentService } from '../services/investmentService';
+import { InvestmentService } from '../services/investmentService';
 import { createInvestmentServiceWithScreening } from '../services/investmentServiceSetup';
 import { AppError } from '../lib/errors';
 import {
@@ -11,6 +11,8 @@ import {
   PostgresIdempotencyStore,
 } from '../middleware/idempotency';
 import { requireMobileAttestation } from '../security/mobileAttestation';
+import { AMLService, createAMLService } from '../aml/amlService';
+import { InMemorySecurityAuditRepository } from '../security/audit';
 import crypto from 'crypto';
 
 export const DEFAULT_INVESTMENT_IDEMPOTENCY_TTL_MS = 24 * 60 * 60 * 1000; // 24 hours
@@ -63,17 +65,48 @@ function requireIdempotencyKey(req: Request, res: Response, next: NextFunction):
 }
 
 /**
+ * Optional dependencies that callers may inject into the investments router.
+ * Providing a pre-built `amlService` is preferred in production so that a
+ * single AML service instance is shared across routers (avoids duplicate repos
+ * and audit-log repositories).  When omitted the router builds one internally
+ * using an in-memory audit repository, which is acceptable for the API role but
+ * means AML audit events won't reach the persistent security-audit store.
+ */
+export interface InvestmentsRouterDeps {
+  /** AML service used for transaction monitoring after each investment is created. */
+  amlService?: AMLService;
+  /**
+   * Pre-built InvestmentService.  Intended for tests that need to inject a
+   * spy service without wiring a full DB stack.  In production this should
+   * always be omitted so the router builds the service with its real repos.
+   */
+  investmentService?: InvestmentService;
+}
+
+/**
  * Factory that creates an Express Router for investment endpoints.
  * Requires the caller to supply a pg Pool for database access.
+ *
+ * @param db   - Postgres connection pool.
+ * @param deps - Optional dependencies.  Pass `{ amlService }` to wire transaction
+ *               monitoring; omitting it causes the router to build a default
+ *               AML service backed by an in-memory audit repository.
  */
-export function createInvestmentsRouter(
-  db: Pool,
-  options: InvestmentsRouterOptions = {}
-): Router {
+export function createInvestmentsRouter(db: Pool, deps: InvestmentsRouterDeps = {}): Router {
   const router = Router();
   const investmentRepo = new InvestmentRepository(db);
+
+  // Resolve AML service: prefer an injected one (e.g. from index.ts where the
+  // shared InMemorySecurityAuditRepository is already wired), fall back to
+  // building a standalone instance.  Never pass undefined — the absence of AML
+  // monitoring was the root bug (#1288).
+  const amlService: AMLService =
+    deps.amlService ??
+    createAMLService(db, new InMemorySecurityAuditRepository(), 'system');
+
   const investmentService: InvestmentService =
-    options.investmentService || createInvestmentServiceWithScreening(db);
+    deps.investmentService ??
+    createInvestmentServiceWithScreening(db, amlService);
 
   const ttlMs = options.idempotencyTtlMs ?? DEFAULT_INVESTMENT_IDEMPOTENCY_TTL_MS;
   const store =
