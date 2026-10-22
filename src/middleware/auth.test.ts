@@ -10,7 +10,6 @@ import {
   resetAdminPubKeysCache,
   AdminSignatureContext,
 } from './auth';
-import { hashSessionToken } from '../auth/session';
 import { signJwt } from '../utils/jwt';
 import {
   issueToken,
@@ -20,6 +19,8 @@ import {
 } from '../lib/jwt';
 import { AuthenticatedRequest as LogoutAuthenticatedRequest } from '../auth/logout/types';
 import { AppError } from '../lib/errors';
+import { LoginService } from '../auth/login/loginService';
+import { JwtIssuer, SessionRepository, UserRecord, UserRepository } from '../auth/login/types';
 
 // ── Shared secret setup ───────────────────────────────────────────────────────
 beforeAll(() => {
@@ -1282,4 +1283,3 @@ describe('regression: LoginService with createRequireAuth middleware', () => {
     expect((mockNext.mock.calls[0][0] as AppError).message).toBe('Unauthorized: refresh token consumed');
   });
 });
-
