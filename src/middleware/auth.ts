@@ -18,7 +18,7 @@ import {
   AuthenticatedRequest as LogoutAuthenticatedRequest,
 } from "../auth/logout/types";
 import { SessionRepository as DbSessionRepository } from "../db/repositories/sessionRepository";
-import { hashSessionToken, isSessionExpired } from "../auth/session";
+import { isSessionExpired } from "../auth/session";
 import { Errors } from "../lib/errors";
 import { globalLogger } from "../lib/logger";
 import { pool } from "../db/pool";
@@ -605,7 +605,41 @@ export function createRequireAuth(
         userId: payload.sub,
         path: req.path,
       });
-      next(Errors.unauthorized("Unauthorized: invalid or inactive session"));
+      next(
+        Errors.unauthorized("Unauthorized: session not found or user mismatch"),
+      );
+      return;
+    }
+
+    if (isSessionExpired(session.expires_at)) {
+      globalLogger.warn("Auth failed: Session expired", {
+        sessionId: payload.sid,
+        userId: payload.sub,
+        path: req.path,
+      });
+      next(Errors.unauthorized("Unauthorized: session expired"));
+      return;
+    }
+
+    if (session.revoked_at) {
+      globalLogger.warn("Auth failed: Session revoked", {
+        sessionId: payload.sid,
+        userId: payload.sub,
+        revokedAt: session.revoked_at,
+        path: req.path,
+      });
+      next(Errors.unauthorized("Unauthorized: session revoked"));
+      return;
+    }
+
+    if (session.token_consumed_at) {
+      globalLogger.warn("Auth failed: Refresh token already consumed", {
+        sessionId: payload.sid,
+        userId: payload.sub,
+        consumedAt: session.token_consumed_at,
+        path: req.path,
+      });
+      next(Errors.unauthorized("Unauthorized: refresh token consumed"));
       return;
     }
 
