@@ -6,7 +6,10 @@
     "origin",
     "security/issue-1266-security-password-reset-rate-limiter-throws",
     "security/issue-1290-security-sanctions-investment-screening-uses",
-    "security/issue-1295-security-offerings-offerings-validation-matrix"
+    "security/issue-1295-security-offerings-offerings-validation-matrix",
+    "fix/issue-1303-fix-distributions-resuming-a-partial-run",
+    "security/issue-1268-security-jwt-access-and-refresh-tokens-are",
+    "security/issue-1293-security-password-reset-resetpassword-skips"
   ],
   "parent": {
     "feat/autoscale-db-pool-signal": "master",
@@ -14,7 +17,10 @@
     "origin": "master",
     "security/issue-1266-security-password-reset-rate-limiter-throws": "master",
     "security/issue-1290-security-sanctions-investment-screening-uses": "master",
-    "security/issue-1295-security-offerings-offerings-validation-matrix": "master"
+    "security/issue-1295-security-offerings-offerings-validation-matrix": "master",
+    "fix/issue-1303-fix-distributions-resuming-a-partial-run": "master",
+    "security/issue-1268-security-jwt-access-and-refresh-tokens-are": "master",
+    "security/issue-1293-security-password-reset-resetpassword-skips": "master"
   },
   "order": [
     "master",
@@ -22,6 +28,9 @@
     "origin",
     "security/issue-1266-security-password-reset-rate-limiter-throws",
     "security/issue-1290-security-sanctions-investment-screening-uses",
-    "security/issue-1295-security-offerings-offerings-validation-matrix"
+    "security/issue-1295-security-offerings-offerings-validation-matrix",
+    "fix/issue-1303-fix-distributions-resuming-a-partial-run",
+    "security/issue-1268-security-jwt-access-and-refresh-tokens-are",
+    "security/issue-1293-security-password-reset-resetpassword-skips"
   ]
 }
